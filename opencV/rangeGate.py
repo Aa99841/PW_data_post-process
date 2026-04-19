@@ -25,6 +25,37 @@ def padding_Replication(img, size=230):
     
     return padded
 
+def pruning_skeleton_small(skeleton_cv):
+    skeleton_bool = (skeleton_cv > 0)
+
+    skel = Skeleton(skeleton_bool)
+    stats = summarize(skel, separator='_')  
+
+    pruned_skeleton = skeleton_cv.copy()
+    height, width = skeleton_cv.shape
+
+    for _ in range(3): 
+        skel = Skeleton(pruned_skeleton > 0)
+        stats = summarize(skel, separator='_')
+        
+        for i in range(len(stats)):
+            # 這裡記得用你剛修正過的底線符號
+            branch_type = stats.loc[i, 'branch_type']
+            branch_dist = stats.loc[i, 'branch_distance']
+            
+            if branch_type == 1:  # 端點到分岔點
+                coords = skel.path_coordinates(i)
+                endpoint = coords[-1]
+                
+                # 邊界保護邏輯
+                is_near_border = (endpoint[1] < 5) or (endpoint[1] > width - 5)
+                
+                # 如果不是邊界附近的短毛刺，就把它抹除
+                if branch_dist < 30 and not is_near_border:
+                    for r, c in coords.astype(int):
+                        pruned_skeleton[r, c] = 0
+    return pruned_skeleton
+
 def pruning_skeleton(skeleton_cv):
     if not np.any(skeleton_cv > 0):
         return skeleton_cv
@@ -138,6 +169,7 @@ skeleton_cv = skeleton_cv[cuty1:cuty2 , cutx1:cutx2]
 
 # ======= 剪枝 ======= 
 pruned_skeleton = pruning_skeleton(skeleton_cv)
+pruned_skeleton = pruning_skeleton_small(pruned_skeleton)
 
 # ======= 畫 range gate ======= 
 target_ratio = 0.5     # 血管中點
