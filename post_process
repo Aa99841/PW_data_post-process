@@ -1,0 +1,480 @@
+import math
+import cv2
+import os
+import time
+import numpy as np
+from pathlib import Path
+from skimage.morphology import medial_axis, skeletonize
+from skan import Skeleton, summarize
+
+def resize(img, size):
+
+    h, w = img.shape[:2]
+
+    # 計算縮放比例
+    scale = size / min(h, w)
+
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    # resize
+    resized = cv2.resize(img, (new_w, new_h))
+
+    return resized
+
+def crop(img, x1, x2, y1, y2):
+
+    # x1, y1 = 0, 100
+    # x2, y2 = 900, 800
+    
+    cropped = img[y1:y2, x1:x2]
+
+    return cropped
+
+def padding_Replication(img):    
+    padded = cv2.copyMakeBorder(
+        img,
+        3, 3, 3, 3,
+        cv2.BORDER_REPLICATE,
+        value=0
+    )
+    
+    return padded
+
+def pruning_skeleton(skeleton_cv):
+    if not np.any(skeleton_cv > 0):
+        return skeleton_cv
+
+    try:
+        # 1. 將二值化影像轉化為一個圖數據結構，識別端點、分岔點
+        skel = Skeleton(skeleton_cv > 0)
+        
+        # 2. 列出圖中每一條「分支」的資訊
+        stats = summarize(skel, separator='_') 
+        if stats.empty:
+            return skeleton_cv
+        
+        pruned_skeleton = skeleton_cv.copy()
+        
+        junctions = stats[stats['branch_type'] == 2] # 2 代表 節點到節點 (通常主幹中間)
+        tips = stats[stats['branch_type'] == 1]      # 1 代表 端點到節點 (分岔)
+
+        # 找到較短分支剪掉
+        if not tips.empty:
+            tips_sorted = tips.sort_values(by='branch_distance', ascending=False) # 將所有端點分支按長度由長到短排序
+            
+            to_prune = tips_sorted.iloc[2:] # 將第三個頭（分岔）剪掉
+            # to_prune += tips[tips['branch_distance'] < 50]
+
+            for idx in to_prune.index:
+                coords = skel.path_coordinates(idx) # 取得該分支所有像素的座標
+                for r, c in coords.astype(int):
+                    pruned_skeleton[r, c] = 0 
+                    
+        return pruned_skeleton
+
+    except Exception as e:
+        print(f"剪枝失敗: {e}")
+        return skeleton_cv
+
+def detected_line(img):
+
+    # ====== 建立彩色範圍 ======
+    lower_green = np.array([0, 0, 200])
+    upper_green = np.array([0, 0, 255])
+
+    # ====== 抓取符合色彩範圍內的像素成為新影像 ======
+    mask = cv2.inRange(img, lower_green, upper_green) 
+    
+    green_points = np.where(mask == 255)
+    
+    if len(green_points[0]) > 0:
+        # 將座標轉換成 (x, y) 的列表
+        all_points = list(zip(green_points[1], green_points[0]))
+        
+        # 找出最上方的點（Y最小）和最下方的點（Y最大）
+        p_top = min(all_points, key=lambda p: p[1])
+        p_bottom = max(all_points, key=lambda p: p[1])
+        
+        return p_top, p_bottom
+    
+    return None, None
+
+def draw_perpendicular_line(image, line_p1, line_p2, point, length=50, color=(0, 255, 0), thickness=2):
+    """
+    在指定點畫出與直線垂直的線
+    
+    Parameters:
+        image: 輸入圖像
+        line_p1: 原直線的第一個點 (x, y)
+        line_p2: 原直線的第二個點 (x, y)
+        point: 要畫垂直線的點 (x, y)
+        length: 垂直線的長度（兩側各 length/2）
+        color: 線條顏色 (B, G, R)
+        thickness: 線條粗細
+    """
+    # 計算原直線的方向向量
+    dx = line_p2[0] - line_p1[0]
+    dy = line_p2[1] - line_p1[1]
+    
+    # 計算原直線的長度
+    line_length = math.sqrt(dx**2 + dy**2)
+    
+    if line_length == 0:
+        return None
+    
+    # 計算單位方向向量
+    ux = dx / line_length
+    uy = dy / line_length
+    
+    # 垂直向量（旋轉90度）
+    perp_x = -uy
+    perp_y = ux
+    
+    # 計算垂直線的兩個端點
+    half_length = length / 2
+    p1 = (int(point[0] + perp_x * half_length), int(point[1] + perp_y * half_length))
+    p2 = (int(point[0] - perp_x * half_length), int(point[1] - perp_y * half_length))
+    
+    # 繪製垂直線
+    cv2.line(image, p1, p2, color, thickness)
+    
+    return p1, p2
+
+def get_tangent_direction(skeleton, point, window_size=15):
+    x0, y0 = point
+
+    h, w = skeleton.shape
+
+    # 取 ROI
+    x1 = max(0, x0 - window_size)
+    x2 = min(w, x0 + window_size)
+    y1 = max(0, y0 - window_size)
+    y2 = min(h, y0 + window_size)
+
+    roi = skeleton[y1:y2, x1:x2]
+
+    # 找 skeleton 點
+    ys, xs = np.where(roi > 0)
+
+    if len(xs) < 2:
+        return None  # 點太少無法估
+
+    # 轉回全圖座標
+    xs = xs + x1
+    ys = ys + y1
+
+    points = np.column_stack((xs, ys)).astype(np.float32) # 疊成一個 array
+
+    # PCA
+    mean = np.mean(points, axis=0)
+    centered = points - mean
+
+    _, _, vt = np.linalg.svd(centered)
+
+    direction = vt[0]  # 第一主成分
+
+    return direction  # (dx, dy)
+
+def draw_tangent(img, point, direction, length=20):
+    x0, y0 = point
+    dx, dy = direction
+
+    # 正規化
+    norm = np.sqrt(dx**2 + dy**2)
+    dx /= norm
+    dy /= norm
+
+    x1 = int(x0 - dx * length)
+    y1 = int(y0 - dy * length)
+    x2 = int(x0 + dx * length)
+    y2 = int(y0 + dy * length)
+
+    cv2.line(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
+    
+def separate_white_regions_advanced(image, min_area=100, 
+                                     distance_threshold=10,
+                                     save_separate=True, 
+                                     output_dir=None,
+                                     visualize=True):
+    """
+    Parameters:
+        image: 輸入的二值圖像
+        min_area: 最小區域面積
+        distance_threshold: 距離閾值，小於此距離的區域可能被視為同一區域
+        save_separate: 是否儲存分離後的圖片
+        output_dir: 輸出目錄
+        visualize: 是否顯示視覺化結果
+    
+    Returns:
+        white_regions: 分離的白色區域列表
+        region_info: 區域資訊
+        is_separated: 是否被隔斷
+    """
+    if len(image.shape) == 3:
+        binary = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        binary = image.copy()
+    
+    _, binary = cv2.threshold(binary, 127, 255, cv2.THRESH_BINARY)
+    
+    # 方法1：使用連通組件找出初始區域
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    
+    # 分析區域之間的關係
+    regions = []
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            regions.append({
+                'label': i,
+                'area': area,
+                'centroid': centroids[i],
+                'bbox': (stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP],
+                        stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]),
+                'mask': (labels == i).astype(np.uint8) * 255
+            })
+    
+    # 判斷是否有黑色隔斷（多個區域）
+    is_separated = len(regions) > 1
+    
+    # # 檢查區域是否太接近（可能不應該分開）
+    # if len(regions) > 1:
+    #     merged = []
+    #     used = [False] * len(regions)
+        
+    #     for i in range(len(regions)):
+    #         if used[i]:
+    #             continue
+            
+    #         current_group = [regions[i]]
+    #         used[i] = True
+            
+    #         for j in range(len(regions)):
+    #             if not used[j]:
+    #                 # 計算兩個區域中心點的距離
+    #                 dist = np.linalg.norm(regions[i]['centroid'] - regions[j]['centroid'])
+    #                 if dist < distance_threshold:
+    #                     current_group.append(regions[j])
+    #                     used[j] = True
+            
+    #         # 合併接近的區域
+    #         if len(current_group) > 1:
+    #             merged_mask = np.zeros_like(binary)
+    #             for region in current_group:
+    #                 merged_mask = cv2.bitwise_or(merged_mask, region['mask'])
+    #             merged.append(merged_mask)
+    #         else:
+    #             merged.append(current_group[0]['mask'])
+        
+    #     white_regions = merged
+    # else:
+    #     white_regions = [regions[0]['mask']] if regions else []
+    
+    # # 儲存分離的圖片
+    # if save_separate and output_dir and white_regions:
+    #     output_path = Path(output_dir)
+    #     output_path.mkdir(parents=True, exist_ok=True)
+        
+    #     for idx, region_mask in enumerate(white_regions):
+    #         area = cv2.countNonZero(region_mask)
+    #         filename = output_path / f"separated_region_{idx+1}_area_{area}.png"
+    #         cv2.imwrite(str(filename), region_mask)
+    #         print(f"儲存區域 {idx+1}: {filename}")
+    
+    return regions, is_separated
+
+def check_black_separation(binary_image, min_gap_width=1):
+    """
+    專門檢查白色區域是否被黑色隔斷
+    
+    Parameters:
+        binary_image: 二值圖像
+        min_gap_width: 最小黑色間隙寬度（像素）
+    
+    Returns:
+        is_separated: 是否被隔斷
+        num_regions: 白色區域數量
+        separation_positions: 分隔位置
+    """
+    if len(binary_image.shape) == 3:
+        binary = cv2.cvtColor(binary_image, cv2.COLOR_BGR2GRAY)
+    else:
+        binary = binary_image.copy()
+    
+    _, binary = cv2.threshold(binary, 127, 255, cv2.THRESH_BINARY)
+    
+    # 找出所有白色區域
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    
+    # 白色區域數量（扣除背景）
+    num_regions = num_labels - 1
+    
+    # 判斷是否被隔斷
+    is_separated = num_regions > 1
+    
+    # 找出分隔位置（如果有多個區域）
+    separation_positions = []
+    if is_separated:
+        # 計算每個區域的垂直投影和水平投影
+        h, w = binary.shape
+        
+        # 垂直投影（找出黑色間隙）
+        vertical_projection = np.sum(binary == 255, axis=0)
+        
+        # 找出可能的垂直分隔線
+        for x in range(w):
+            if vertical_projection[x] == 0:  # 全黑列
+                # 檢查左右是否有白色區域
+                left_white = np.any(vertical_projection[:x] > 0)
+                right_white = np.any(vertical_projection[x+1:] > 0)
+                if left_white and right_white:
+                    separation_positions.append(('vertical', x))
+        
+        # 水平投影（找出黑色間隙）
+        horizontal_projection = np.sum(binary == 255, axis=1)
+        
+        for y in range(h):
+            if horizontal_projection[y] == 0:  # 全黑行
+                top_white = np.any(horizontal_projection[:y] > 0)
+                bottom_white = np.any(horizontal_projection[y+1:] > 0)
+                if top_white and bottom_white:
+                    separation_positions.append(('horizontal', y))
+    
+    return is_separated, num_regions, separation_positions
+
+def smooth_vessel_mask(mask, method, iterations):
+    """
+    平滑血管 mask 的邊緣
+    
+    Parameters:
+        mask: 輸入的二值遮罩
+        method: 'morphological', 'gaussian', 'bilateral'
+        iterations: 迭代次數
+    """
+    if method == 'morphological':
+        # 形態學平滑（先閉運算再開運算）
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        
+        # 閉運算：填補小洞
+        closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=iterations)
+        
+        # 開運算：移除小突起
+        smoothed = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=iterations)
+        
+    elif method == 'gaussian':
+        # 高斯模糊後二值化
+        blurred = cv2.GaussianBlur(mask.astype(np.float32), (20, 20), 0)
+        smoothed = (blurred > 127).astype(np.uint8) * 255
+        
+    elif method == 'bilateral':
+        # 雙邊濾波（保留邊緣）
+        bilateral = cv2.bilateralFilter(mask.astype(np.uint8), 9, 75, 75)
+        smoothed = bilateral
+        
+    return smoothed
+
+# ========= main ========= 
+start_time = time.perf_counter()
+
+line = cv2.imread(r"C:\collega\Project\dealData_test\detected_line\line\data1\data1_clip_643s_7.78s.png")
+img = cv2.imread(r"C:\collega\Project\post_precessor\masks_cleaned\data1_clip_643s_7.78s_label.png", 0)
+
+image = resize(img, 900)
+image = crop(image, 0, 900, 100, 800)
+
+p_top, p_bottom = detected_line(line)
+print(f"p_top:{p_top[0]}, p_bottom:{p_bottom[0]}")
+
+if p_top[0] > p_bottom[0]:
+    x1 = p_bottom[0] - 20
+    x2 = p_top[0] + 20
+    h = x2 - x1
+else :
+    x1 = p_top[0] - 20
+    x2 = p_bottom[0] + 20
+    h = x2 - x1
+
+lines = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+cv2.line(lines, p_top, p_bottom, 255, 1) 
+
+# line = crop(line, x1, x2, 0, 700)
+image_crop = crop(image, x1, x2, 0, 700)
+# image_crop = crop(image, 0, 900, 0, 700)
+
+
+if check_black_separation(image_crop)[0]:
+    image_crop = separate_white_regions_advanced(image_crop, min_area=100, save_separate=False, output_dir="./separated_regions", visualize=False)[0][0]['mask']
+
+# kernel = np.ones((50, 50), np.uint8)   
+blur = smooth_vessel_mask(image_crop, method='morphological', iterations=5)
+
+#  ======= padding ======= 
+bin_padR = padding_Replication(blur)
+
+#  ======= 使用 OpenCV 進行骨架化 =======
+skeleton_cv = cv2.ximgproc.thinning(bin_padR, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
+# skeleton_cv = pruning_skeleton(skeleton_cv)
+skeleton_cv = crop(skeleton_cv, 3, h+3, 3, 703)
+
+result_skeleton = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+result_skeleton[0:700, x1:x2] = skeleton_cv
+
+print(f"{lines.shape}, {result_skeleton.shape}")
+
+intersection_mask = cv2.bitwise_and(lines, result_skeleton)
+points = np.where(intersection_mask == 255)
+points_list = list(zip(points[1], points[0]))
+
+# 4. 視覺化
+result = image.copy()
+result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
+    
+# 畫直線（藍色）
+cv2.line(result, p_top, p_bottom, (0, 255, 0), 1)
+    
+# 畫骨架（綠色）- 可選
+skeleton_color = cv2.cvtColor(result_skeleton, cv2.COLOR_GRAY2BGR)
+skeleton_color[result_skeleton == 255] = [0, 255, 0]
+result = cv2.addWeighted(result, 0.7, skeleton_color, 0.3, 0)
+    
+# 標記交點（紅色）
+# for point in points_list:
+#     cv2.circle(result, point, 4, (0, 0, 255), -1)
+#     cv2.circle(result, point, 6, (0, 0, 255), 1)
+
+print(f"找到 {len(points_list)} 個交點")
+
+# ======== 處理交點 ==========
+if len(points_list) >= 1:
+    mask = cv2.bitwise_and(lines, image)
+    green_points = np.where(mask == 255)
+    
+    result[mask == 255] = [255, 255, 255]
+    
+    # 畫 range gate
+    if len(green_points[0]) > 0:
+        all_points = list(zip(green_points[1], green_points[0]))
+        
+        intersection_top = min(all_points, key=lambda p: p[1])
+        intersection_bottom = max(all_points, key=lambda p: p[1])
+                   
+        draw_perpendicular_line(result, p_top, p_bottom, intersection_top, length=50, color=(0, 0, 255), thickness=2)
+        draw_perpendicular_line(result, p_top, p_bottom, intersection_bottom, length=50, color=(0, 0, 255), thickness=2)
+       
+    # 畫 angels 
+    direction = get_tangent_direction(skeleton_cv, points_list[0])
+    print(f"direction: {direction}")
+   
+    if direction is not None:
+        draw_tangent(result, points_list[0], direction)
+    
+end_time = time.perf_counter()
+elapsed_time = end_time - start_time
+print(f"程式執行時間: {elapsed_time:.6f} 秒")
+cv2.imshow("blur", blur)
+cv2.imshow("image_crop", image_crop)
+cv2.imshow("skeleton_cv", skeleton_cv)
+cv2.imshow("Intersection Detection", result)
+cv2.waitKey(0)
+cv2.destroyAllWindows()
